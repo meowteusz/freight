@@ -1,0 +1,326 @@
+#!/bin/bash
+set -euo pipefail
+
+# Get script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/logging.sh"
+source "$LIB_DIR/socket.sh"
+
+# Tool configuration
+TOOL_NAME="scan"
+VERSION="0.1.0"
+
+# Default configuration
+DEFAULT_CACHE_DIRS=(".cache" "__pycache__" ".pytest_cache" "node_modules" ".git")
+
+# Usage information
+usage() {
+    cat << EOF
+freight-scan - Directory Snapshot Scanner
+
+USAGE:
+    freight-scan [OPTIONS] [DIRECTORY]
+
+ARGUMENTS:
+    DIRECTORY    Directory to scan (default: current directory)
+
+OPTIONS:
+    -h, --help       Show this help message
+    -v, --verbose    Enable verbose output
+    -q, --quiet      Suppress non-error output
+    --version        Show version information
+    --force          Force rescan even if cache exists
+    --no-cache       Disable caching of scan results
+
+DESCRIPTION:
+    Recursively scans a directory to catalog files, calculate sizes,
+    and generate metadata for migration planning. Results are stored
+    in .freight/scan.json for use by other freight tools.
+
+EXAMPLES:
+    freight-scan                    # Scan current directory
+    freight-scan /path/to/data      # Scan specific directory
+    freight-scan --force ~/user1    # Force rescan ignoring cache
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    SCAN_DIR="."
+    VERBOSE=false
+    QUIET=false
+    FORCE_SCAN=false
+    NO_CACHE=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_ERROR
+                shift
+                ;;
+            --version)
+                echo "freight-scan $VERSION"
+                exit 0
+                ;;
+            --force)
+                FORCE_SCAN=true
+                shift
+                ;;
+            --no-cache)
+                NO_CACHE=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage >&2
+                exit 1
+                ;;
+            *)
+                SCAN_DIR="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# Check if scan cache is valid
+is_cache_valid() {
+    local scan_file="$1"
+    local target_dir="$2"
+    
+    if [[ "$NO_CACHE" == "true" || "$FORCE_SCAN" == "true" ]]; then
+        return 1
+    fi
+    
+    if [[ ! -f "$scan_file" ]]; then
+        return 1
+    fi
+    
+    # Check if scan file is newer than directory modification
+    if [[ "$scan_file" -ot "$target_dir" ]]; then
+        log_debug "Cache invalid: directory modified after scan"
+        return 1
+    fi
+    
+    # TODO: Add more sophisticated cache validation
+    # - Check if configuration changed
+    # - Validate scan file format
+    
+    return 0
+}
+
+# Perform directory scan
+perform_scan() {
+    local target_dir="$1"
+    local freight_dir="$2"
+    local scan_file="$3"
+    local operation_id
+    
+    operation_id="$(log_operation_start "scan" "$target_dir")"
+    local start_time
+    start_time="$(date +%s)"
+    
+    log_info "Starting directory scan: $target_dir"
+    socket_start "$TOOL_NAME" "$target_dir"
+    
+    # Initialize scan results
+    local total_size=0
+    local total_files=0
+    local total_dirs=0
+    local largest_files=()
+    
+    # Create temporary files for processing
+    local temp_dir
+    temp_dir="$(mktemp -d)"
+    local file_list="$temp_dir/files.txt"
+    local size_list="$temp_dir/sizes.txt"
+    
+    # Cleanup function
+    cleanup_temp() {
+        rm -rf "$temp_dir"
+    }
+    trap cleanup_temp EXIT
+    
+    # Find all files and directories
+    log_info "Discovering files and directories..."
+    socket_progress "$TOOL_NAME" "$target_dir" "Discovering files"
+    
+    find "$target_dir" -type f -printf "%s %p\n" 2>/dev/null > "$file_list" || {
+        log_error "Failed to scan directory: $target_dir"
+        socket_stop "$TOOL_NAME" "$target_dir" "failed" "" "Directory scan failed"
+        return 1
+    }
+    
+    # Process file list
+    total_files="$(wc -l < "$file_list")"
+    log_info "Found $total_files files"
+    socket_progress "$TOOL_NAME" "$target_dir" "Processing $total_files files"
+    
+    # Calculate total size and find largest files
+    while IFS=' ' read -r size filepath; do
+        total_size=$((total_size + size))
+        
+        # Track largest files (top 10)
+        if (( ${#largest_files[@]} < 10 )); then
+            largest_files+=("$size:$filepath")
+        else
+            # Simple insertion sort for top 10
+            local min_size="${largest_files[0]%%:*}"
+            if (( size > min_size )); then
+                largest_files[0]="$size:$filepath"
+                # Re-sort array (simple bubble sort for small array)
+                for ((i=0; i<${#largest_files[@]}-1; i++)); do
+                    for ((j=0; j<${#largest_files[@]}-1-i; j++)); do
+                        local size1="${largest_files[j]%%:*}"
+                        local size2="${largest_files[j+1]%%:*}"
+                        if (( size1 > size2 )); then
+                            local temp="${largest_files[j]}"
+                            largest_files[j]="${largest_files[j+1]}"
+                            largest_files[j+1]="$temp"
+                        fi
+                    done
+                done
+            fi
+        fi
+    done < "$file_list"
+    
+    # Count directories
+    total_dirs="$(find "$target_dir" -type d 2>/dev/null | wc -l)"
+    
+    # Calculate scan duration
+    local end_time
+    end_time="$(date +%s)"
+    local duration=$((end_time - start_time))
+    
+    log_info "Scan completed: $total_files files, $total_dirs directories, $(format_bytes $total_size)"
+    
+    # Generate scan results JSON
+    local scan_results
+    scan_results="$(generate_scan_json "$target_dir" "$operation_id" "$start_time" "$end_time" "$total_size" "$total_files" "$total_dirs" "${largest_files[@]}")"
+    
+    # Write results to file
+    echo "$scan_results" > "$scan_file"
+    log_info "Scan results written to: $scan_file"
+    
+    # Send completion message
+    socket_stop "$TOOL_NAME" "$target_dir" "ok" "$total_size" "Scanned $total_files files"
+    
+    log_operation_end "scan" "$target_dir" "$operation_id" "completed" "$duration" "$total_size"
+}
+
+# Generate scan results JSON
+generate_scan_json() {
+    local target_dir="$1"
+    local operation_id="$2"
+    local start_time="$3"
+    local end_time="$4"
+    local total_size="$5"
+    local total_files="$6"
+    local total_dirs="$7"
+    shift 7
+    local largest_files=("$@")
+    
+    # Build largest files JSON array
+    local largest_files_json="["
+    local first=true
+    for file_entry in "${largest_files[@]}"; do
+        local size="${file_entry%%:*}"
+        local filepath="${file_entry#*:}"
+        
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            largest_files_json+=","
+        fi
+        
+        largest_files_json+="{\"size\":$size,\"path\":\"$filepath\"}"
+    done
+    largest_files_json+="]"
+    
+    # Generate complete JSON
+    cat << EOF
+{
+  "scan_id": "$operation_id",
+  "directory": "$target_dir",
+  "timestamp": "$(get_timestamp)",
+  "start_time": "$(date -d "@$start_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "end_time": "$(date -d "@$end_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "duration": $((end_time - start_time)),
+  "summary": {
+    "total_size": $total_size,
+    "total_files": $total_files,
+    "total_directories": $total_dirs,
+    "largest_files": $largest_files_json
+  },
+  "tool_version": "$VERSION",
+  "hostname": "$(hostname)",
+  "user": "$(whoami)"
+}
+EOF
+}
+
+# Main function
+main() {
+    # Parse arguments
+    parse_args "$@"
+    
+    # Validate target directory
+    if ! validate_directory "$SCAN_DIR" "read"; then
+        exit 1
+    fi
+    
+    # Convert to absolute path
+    SCAN_DIR="$(realpath "$SCAN_DIR")"
+    
+    # Set up logging
+    local freight_dir
+    freight_dir="$(get_freight_dir "$SCAN_DIR")"
+    ensure_freight_dir "$freight_dir"
+    init_logging "$TOOL_NAME" "$freight_dir"
+    
+    # Initialize socket communication
+    socket_init "$TOOL_NAME" "$SCAN_DIR"
+    socket_setup_cleanup
+    
+    # Set up signal handlers
+    setup_signal_handlers
+    
+    log_system_info
+    log_info "freight-scan $VERSION starting"
+    log_info "Target directory: $SCAN_DIR"
+    
+    # Check cache validity
+    local scan_file="$freight_dir/scan.json"
+    if is_cache_valid "$scan_file" "$SCAN_DIR"; then
+        log_info "Using cached scan results: $scan_file"
+        socket_start "$TOOL_NAME" "$SCAN_DIR"
+        socket_stop "$TOOL_NAME" "$SCAN_DIR" "ok" "" "Used cached results"
+        exit 0
+    fi
+    
+    # Perform the scan
+    if perform_scan "$SCAN_DIR" "$freight_dir" "$scan_file"; then
+        log_info "Scan completed successfully"
+        exit 0
+    else
+        log_error "Scan failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

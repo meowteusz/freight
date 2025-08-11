@@ -1,0 +1,401 @@
+#!/bin/bash
+set -euo pipefail
+
+# Get script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/logging.sh"
+source "$LIB_DIR/socket.sh"
+
+# Tool configuration
+TOOL_NAME="clean"
+VERSION="0.1.0"
+
+# Default cache directories to clean
+DEFAULT_CACHE_PATTERNS=(
+    ".cache"
+    "__pycache__"
+    ".pytest_cache"
+    "node_modules"
+    ".npm"
+    ".yarn"
+    ".conda/pkgs"
+    ".pip"
+    ".cargo/registry"
+    ".rustup/toolchains/*/share"
+    "target/debug"
+    "target/release"
+    ".gradle/caches"
+    ".m2/repository"
+)
+
+# Usage information
+usage() {
+    cat << EOF
+freight-clean - Directory Cleaner
+
+USAGE:
+    freight-clean [OPTIONS] [DIRECTORY]
+
+ARGUMENTS:
+    DIRECTORY    Directory to clean (default: current directory)
+
+OPTIONS:
+    -h, --help       Show this help message
+    -v, --verbose    Enable verbose output
+    -q, --quiet      Suppress non-error output
+    --version        Show version information
+    --dry-run        Show what would be deleted without actually deleting
+    --config FILE    Use custom configuration file
+    --pattern GLOB   Add custom pattern to clean (can be used multiple times)
+
+DESCRIPTION:
+    Removes cache and temporary directories that don't need to be migrated.
+    Only operates on directories one level below each student directory root.
+    Saves space and reduces migration time.
+
+EXAMPLES:
+    freight-clean                           # Clean current directory
+    freight-clean --dry-run /path/to/data   # Preview what would be cleaned
+    freight-clean --pattern "*.tmp"         # Add custom pattern
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    CLEAN_DIR="."
+    VERBOSE=false
+    QUIET=false
+    DRY_RUN=false
+    CONFIG_FILE=""
+    CUSTOM_PATTERNS=()
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_ERROR
+                shift
+                ;;
+            --version)
+                echo "freight-clean $VERSION"
+                exit 0
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --pattern)
+                CUSTOM_PATTERNS+=("$2")
+                shift 2
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage >&2
+                exit 1
+                ;;
+            *)
+                CLEAN_DIR="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# Load cleaning patterns from configuration
+load_clean_patterns() {
+    local config_file="$1"
+    local patterns=("${DEFAULT_CACHE_PATTERNS[@]}")
+    
+    # Add custom patterns from command line
+    patterns+=("${CUSTOM_PATTERNS[@]}")
+    
+    # Load patterns from config file if provided
+    if [[ -n "$config_file" && -f "$config_file" ]]; then
+        log_info "Loading clean patterns from: $config_file"
+        
+        # Parse JSON config for clean_patterns array
+        if command -v jq >/dev/null 2>&1; then
+            local config_patterns
+            config_patterns="$(jq -r '.clean_patterns[]?' "$config_file" 2>/dev/null || true)"
+            
+            while IFS= read -r pattern; do
+                if [[ -n "$pattern" ]]; then
+                    patterns+=("$pattern")
+                fi
+            done <<< "$config_patterns"
+        else
+            log_warn "jq not available, cannot parse config file patterns"
+        fi
+    fi
+    
+    printf '%s\n' "${patterns[@]}"
+}
+
+# Calculate directory size before cleaning
+calculate_size() {
+    local dir="$1"
+    
+    if [[ -d "$dir" ]]; then
+        du -sb "$dir" 2>/dev/null | cut -f1
+    else
+        echo "0"
+    fi
+}
+
+# Find directories to clean
+find_clean_targets() {
+    local base_dir="$1"
+    local patterns=("${@:2}")
+    local targets=()
+    
+    log_info "Scanning for cleanable directories in: $base_dir"
+    
+    # Only look one level deep as per architecture
+    for subdir in "$base_dir"/*; do
+        if [[ -d "$subdir" ]]; then
+            local subdir_name
+            subdir_name="$(basename "$subdir")"
+            
+            # Skip hidden directories and freight directories
+            if [[ "$subdir_name" =~ ^\. ]]; then
+                continue
+            fi
+            
+            # Look for matching patterns in this subdirectory
+            for pattern in "${patterns[@]}"; do
+                # Use find with maxdepth to limit recursion
+                while IFS= read -r -d '' target; do
+                    if [[ -d "$target" ]]; then
+                        targets+=("$target")
+                    fi
+                done < <(find "$subdir" -maxdepth 2 -name "$pattern" -type d -print0 2>/dev/null)
+            done
+        fi
+    done
+    
+    printf '%s\n' "${targets[@]}"
+}
+
+# Clean a single directory
+clean_directory() {
+    local target_dir="$1"
+    local size_before
+    size_before="$(calculate_size "$target_dir")"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would remove: $target_dir ($(format_bytes "$size_before"))"
+        return 0
+    fi
+    
+    log_info "Removing: $target_dir ($(format_bytes "$size_before"))"
+    
+    if rm -rf "$target_dir" 2>/dev/null; then
+        log_info "Successfully removed: $target_dir"
+        echo "$size_before"
+    else
+        log_error "Failed to remove: $target_dir"
+        echo "0"
+    fi
+}
+
+# Perform cleaning operation
+perform_clean() {
+    local target_dir="$1"
+    local freight_dir="$2"
+    local operation_id
+    
+    operation_id="$(log_operation_start "clean" "$target_dir")"
+    local start_time
+    start_time="$(date +%s)"
+    
+    log_info "Starting directory cleaning: $target_dir"
+    socket_start "$TOOL_NAME" "$target_dir"
+    
+    # Load configuration
+    local config_file="$freight_dir/config.json"
+    if [[ -n "$CONFIG_FILE" ]]; then
+        config_file="$CONFIG_FILE"
+    fi
+    
+    # Get cleaning patterns
+    local patterns
+    mapfile -t patterns < <(load_clean_patterns "$config_file")
+    
+    log_info "Using ${#patterns[@]} cleaning patterns"
+    log_debug "Patterns: ${patterns[*]}"
+    
+    # Find targets to clean
+    local targets
+    mapfile -t targets < <(find_clean_targets "$target_dir" "${patterns[@]}")
+    
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        log_info "No directories found to clean"
+        socket_stop "$TOOL_NAME" "$target_dir" "ok" "0" "No directories to clean"
+        return 0
+    fi
+    
+    log_info "Found ${#targets[@]} directories to clean"
+    socket_progress "$TOOL_NAME" "$target_dir" "Found ${#targets[@]} directories to clean"
+    
+    # Clean each target
+    local total_saved=0
+    local cleaned_count=0
+    local failed_count=0
+    
+    for target in "${targets[@]}"; do
+        local saved
+        saved="$(clean_directory "$target")"
+        
+        if [[ "$saved" != "0" ]]; then
+            total_saved=$((total_saved + saved))
+            ((cleaned_count++))
+        else
+            ((failed_count++))
+        fi
+        
+        # Send progress update
+        socket_progress "$TOOL_NAME" "$target_dir" "Cleaned $cleaned_count/${#targets[@]} directories" "$total_saved"
+    done
+    
+    # Calculate duration
+    local end_time
+    end_time="$(date +%s)"
+    local duration=$((end_time - start_time))
+    
+    # Generate results
+    local status="ok"
+    local message="Cleaned $cleaned_count directories, saved $(format_bytes "$total_saved")"
+    
+    if [[ "$failed_count" -gt 0 ]]; then
+        status="partial"
+        message="$message ($failed_count failed)"
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        message="[DRY RUN] Would clean $cleaned_count directories, would save $(format_bytes "$total_saved")"
+    fi
+    
+    log_info "Cleaning completed: $message"
+    
+    # Write results to JSON
+    local results_file="$freight_dir/clean.json"
+    generate_clean_json "$target_dir" "$operation_id" "$start_time" "$end_time" "$total_saved" "$cleaned_count" "$failed_count" "${targets[@]}" > "$results_file"
+    
+    # Send completion message
+    socket_stop "$TOOL_NAME" "$target_dir" "$status" "$total_saved" "$message"
+    
+    log_operation_end "clean" "$target_dir" "$operation_id" "$status" "$duration" "$total_saved"
+}
+
+# Generate clean results JSON
+generate_clean_json() {
+    local target_dir="$1"
+    local operation_id="$2"
+    local start_time="$3"
+    local end_time="$4"
+    local total_saved="$5"
+    local cleaned_count="$6"
+    local failed_count="$7"
+    shift 7
+    local targets=("$@")
+    
+    # Build targets JSON array
+    local targets_json="["
+    local first=true
+    for target in "${targets[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            targets_json+=","
+        fi
+        targets_json+="\"$target\""
+    done
+    targets_json+="]"
+    
+    # Generate complete JSON
+    cat << EOF
+{
+  "clean_id": "$operation_id",
+  "directory": "$target_dir",
+  "timestamp": "$(get_timestamp)",
+  "start_time": "$(date -d "@$start_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "end_time": "$(date -d "@$end_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "duration": $((end_time - start_time)),
+  "dry_run": $([[ "$DRY_RUN" == "true" ]] && echo "true" || echo "false"),
+  "summary": {
+    "total_saved": $total_saved,
+    "directories_cleaned": $cleaned_count,
+    "directories_failed": $failed_count,
+    "targets_found": ${#targets[@]}
+  },
+  "targets": $targets_json,
+  "tool_version": "$VERSION",
+  "hostname": "$(hostname)",
+  "user": "$(whoami)"
+}
+EOF
+}
+
+# Main function
+main() {
+    # Parse arguments
+    parse_args "$@"
+    
+    # Validate target directory
+    if ! validate_directory "$CLEAN_DIR" "read"; then
+        exit 1
+    fi
+    
+    # Convert to absolute path
+    CLEAN_DIR="$(realpath "$CLEAN_DIR")"
+    
+    # Set up logging
+    local freight_dir
+    freight_dir="$(get_freight_dir "$CLEAN_DIR")"
+    ensure_freight_dir "$freight_dir"
+    init_logging "$TOOL_NAME" "$freight_dir"
+    
+    # Initialize socket communication
+    socket_init "$TOOL_NAME" "$CLEAN_DIR"
+    socket_setup_cleanup
+    
+    # Set up signal handlers
+    setup_signal_handlers
+    
+    log_system_info
+    log_info "freight-clean $VERSION starting"
+    log_info "Target directory: $CLEAN_DIR"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN MODE - no files will be deleted"
+    fi
+    
+    # Perform the cleaning
+    if perform_clean "$CLEAN_DIR" "$freight_dir"; then
+        log_info "Cleaning completed successfully"
+        exit 0
+    else
+        log_error "Cleaning failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

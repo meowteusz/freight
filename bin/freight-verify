@@ -1,0 +1,582 @@
+#!/bin/bash
+set -euo pipefail
+
+# Get script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/logging.sh"
+source "$LIB_DIR/socket.sh"
+
+# Tool configuration
+TOOL_NAME="verify"
+VERSION="0.1.0"
+
+# Verification modes
+VERIFY_MODE_BASIC="basic"
+VERIFY_MODE_CHECKSUM="checksum"
+VERIFY_MODE_FULL="full"
+
+# Usage information
+usage() {
+    cat << EOF
+freight-verify - Integrity Verifier
+
+USAGE:
+    freight-verify [OPTIONS] SOURCE DESTINATION
+
+ARGUMENTS:
+    SOURCE       Source directory (original)
+    DESTINATION  Destination directory (migrated)
+
+OPTIONS:
+    -h, --help       Show this help message
+    -v, --verbose    Enable verbose output
+    -q, --quiet      Suppress non-error output
+    --version        Show version information
+    --mode MODE      Verification mode: basic, checksum, full (default: basic)
+    --sample-rate N  For checksum mode, verify N% of files (default: 10)
+    --config FILE    Use custom configuration file
+
+DESCRIPTION:
+    Ensures migration completeness and data integrity by comparing
+    source and destination directories. Supports multiple verification
+    levels from basic file counts to full checksum validation.
+
+VERIFICATION MODES:
+    basic    - File count, size, and permission comparison (fast)
+    checksum - Basic + checksum verification of sample files (medium)
+    full     - Basic + checksum verification of all files (slow)
+
+EXAMPLES:
+    freight-verify /nfs1/user1 /nfs2/user1           # Basic verification
+    freight-verify --mode checksum /src /dst         # Sample checksum verification
+    freight-verify --mode full --sample-rate 100 /src /dst  # Full verification
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    VERBOSE=false
+    QUIET=false
+    VERIFY_MODE="$VERIFY_MODE_BASIC"
+    SAMPLE_RATE=10
+    CONFIG_FILE=""
+    SOURCE_DIR=""
+    DEST_DIR=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_ERROR
+                shift
+                ;;
+            --version)
+                echo "freight-verify $VERSION"
+                exit 0
+                ;;
+            --mode)
+                VERIFY_MODE="$2"
+                case "$VERIFY_MODE" in
+                    basic|checksum|full) ;;
+                    *)
+                        log_error "Invalid verification mode: $VERIFY_MODE"
+                        log_error "Valid modes: basic, checksum, full"
+                        exit 1
+                        ;;
+                esac
+                shift 2
+                ;;
+            --sample-rate)
+                SAMPLE_RATE="$2"
+                if ! [[ "$SAMPLE_RATE" =~ ^[0-9]+$ ]] || [[ $SAMPLE_RATE -lt 1 ]] || [[ $SAMPLE_RATE -gt 100 ]]; then
+                    log_error "Sample rate must be between 1 and 100"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$SOURCE_DIR" ]]; then
+                    SOURCE_DIR="$1"
+                elif [[ -z "$DEST_DIR" ]]; then
+                    DEST_DIR="$1"
+                else
+                    log_error "Too many arguments"
+                    usage >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$SOURCE_DIR" || -z "$DEST_DIR" ]]; then
+        log_error "Both SOURCE and DESTINATION are required"
+        usage >&2
+        exit 1
+    fi
+}
+
+# Compare basic directory statistics
+verify_basic() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local discrepancies=()
+    
+    log_info "Performing basic verification..."
+    socket_progress "$TOOL_NAME" "$source_dir" "Basic verification"
+    
+    # Count files and directories
+    local source_files
+    source_files="$(find "$source_dir" -type f 2>/dev/null | wc -l)"
+    local dest_files
+    dest_files="$(find "$dest_dir" -type f 2>/dev/null | wc -l)"
+    
+    local source_dirs
+    source_dirs="$(find "$source_dir" -type d 2>/dev/null | wc -l)"
+    local dest_dirs
+    dest_dirs="$(find "$dest_dir" -type d 2>/dev/null | wc -l)"
+    
+    # Calculate total sizes
+    local source_size
+    source_size="$(get_directory_size "$source_dir")"
+    local dest_size
+    dest_size="$(get_directory_size "$dest_dir")"
+    
+    log_info "Source: $source_files files, $source_dirs directories, $(format_bytes "$source_size")"
+    log_info "Destination: $dest_files files, $dest_dirs directories, $(format_bytes "$dest_size")"
+    
+    # Check for discrepancies
+    if [[ $source_files -ne $dest_files ]]; then
+        discrepancies+=("file_count:source=$source_files,dest=$dest_files")
+        log_warn "File count mismatch: source=$source_files, dest=$dest_files"
+    fi
+    
+    if [[ $source_dirs -ne $dest_dirs ]]; then
+        discrepancies+=("directory_count:source=$source_dirs,dest=$dest_dirs")
+        log_warn "Directory count mismatch: source=$source_dirs, dest=$dest_dirs"
+    fi
+    
+    # Allow small size differences (rsync metadata, filesystem differences)
+    local size_diff=$((source_size > dest_size ? source_size - dest_size : dest_size - source_size))
+    local size_threshold=$((source_size / 1000))  # 0.1% threshold
+    
+    if [[ $size_diff -gt $size_threshold ]]; then
+        discrepancies+=("size:source=$source_size,dest=$dest_size,diff=$size_diff")
+        log_warn "Size difference: $(format_bytes "$size_diff") (threshold: $(format_bytes "$size_threshold"))"
+    fi
+    
+    # Return results
+    echo "$source_files"
+    echo "$dest_files"
+    echo "$source_dirs"
+    echo "$dest_dirs"
+    echo "$source_size"
+    echo "$dest_size"
+    printf '%s\n' "${discrepancies[@]}"
+}
+
+# Generate file list for checksum verification
+generate_file_sample() {
+    local source_dir="$1"
+    local sample_rate="$2"
+    local temp_file
+    temp_file="$(mktemp)"
+    
+    # Get all files with relative paths
+    find "$source_dir" -type f -printf "%P\n" 2>/dev/null | sort > "$temp_file"
+    
+    local total_files
+    total_files="$(wc -l < "$temp_file")"
+    
+    if [[ $sample_rate -eq 100 ]]; then
+        # Return all files
+        cat "$temp_file"
+    else
+        # Sample files
+        local sample_count
+        sample_count=$(( (total_files * sample_rate) / 100 ))
+        if [[ $sample_count -lt 1 ]]; then
+            sample_count=1
+        fi
+        
+        # Use shuf to randomly sample files
+        if command -v shuf >/dev/null 2>&1; then
+            shuf -n "$sample_count" "$temp_file"
+        else
+            # Fallback: take every Nth file
+            local step
+            step=$((total_files / sample_count))
+            if [[ $step -lt 1 ]]; then
+                step=1
+            fi
+            awk "NR % $step == 1" "$temp_file"
+        fi
+    fi
+    
+    rm -f "$temp_file"
+}
+
+# Calculate file checksum
+calculate_checksum() {
+    local file_path="$1"
+    
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file_path" 2>/dev/null | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file_path" 2>/dev/null | cut -d' ' -f1
+    else
+        # Fallback to md5
+        if command -v md5sum >/dev/null 2>&1; then
+            md5sum "$file_path" 2>/dev/null | cut -d' ' -f1
+        elif command -v md5 >/dev/null 2>&1; then
+            md5 -q "$file_path" 2>/dev/null
+        else
+            log_error "No checksum utility available (sha256sum, shasum, md5sum, md5)"
+            return 1
+        fi
+    fi
+}
+
+# Verify checksums
+verify_checksums() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local sample_rate="$3"
+    local checksum_discrepancies=()
+    local files_checked=0
+    local files_matched=0
+    local files_failed=0
+    
+    log_info "Performing checksum verification (sample rate: ${sample_rate}%)..."
+    socket_progress "$TOOL_NAME" "$source_dir" "Checksum verification ${sample_rate}%"
+    
+    # Generate file sample
+    local file_sample
+    file_sample="$(generate_file_sample "$source_dir" "$sample_rate")"
+    local total_sample_files
+    total_sample_files="$(echo "$file_sample" | wc -l)"
+    
+    log_info "Verifying checksums for $total_sample_files files"
+    
+    # Process each file in sample
+    local processed=0
+    while IFS= read -r relative_path; do
+        if [[ -z "$relative_path" ]]; then
+            continue
+        fi
+        
+        local source_file="$source_dir/$relative_path"
+        local dest_file="$dest_dir/$relative_path"
+        
+        ((processed++))
+        ((files_checked++))
+        
+        # Progress update every 100 files
+        if (( processed % 100 == 0 )); then
+            socket_progress "$TOOL_NAME" "$source_dir" "Verified $processed/$total_sample_files files"
+        fi
+        
+        # Check if destination file exists
+        if [[ ! -f "$dest_file" ]]; then
+            checksum_discrepancies+=("missing_file:$relative_path")
+            ((files_failed++))
+            log_warn "Missing destination file: $relative_path"
+            continue
+        fi
+        
+        # Calculate checksums
+        local source_checksum
+        source_checksum="$(calculate_checksum "$source_file")"
+        local dest_checksum
+        dest_checksum="$(calculate_checksum "$dest_file")"
+        
+        if [[ -z "$source_checksum" || -z "$dest_checksum" ]]; then
+            checksum_discrepancies+=("checksum_error:$relative_path")
+            ((files_failed++))
+            log_warn "Failed to calculate checksum for: $relative_path"
+            continue
+        fi
+        
+        # Compare checksums
+        if [[ "$source_checksum" != "$dest_checksum" ]]; then
+            checksum_discrepancies+=("checksum_mismatch:$relative_path:source=$source_checksum,dest=$dest_checksum")
+            ((files_failed++))
+            log_warn "Checksum mismatch: $relative_path"
+        else
+            ((files_matched++))
+        fi
+        
+    done <<< "$file_sample"
+    
+    log_info "Checksum verification completed: $files_matched matched, $files_failed failed out of $files_checked checked"
+    
+    # Return results
+    echo "$files_checked"
+    echo "$files_matched"
+    echo "$files_failed"
+    printf '%s\n' "${checksum_discrepancies[@]}"
+}
+
+# Perform verification
+perform_verification() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local freight_dir="$3"
+    local operation_id
+    
+    operation_id="$(log_operation_start "verify" "$source_dir")"
+    local start_time
+    start_time="$(date +%s)"
+    
+    log_info "Starting verification: $source_dir vs $dest_dir"
+    log_info "Verification mode: $VERIFY_MODE"
+    socket_start "$TOOL_NAME" "$source_dir"
+    
+    # Perform basic verification
+    local basic_result
+    basic_result="$(verify_basic "$source_dir" "$dest_dir")"
+    
+    local source_files
+    source_files="$(echo "$basic_result" | sed -n '1p')"
+    local dest_files
+    dest_files="$(echo "$basic_result" | sed -n '2p')"
+    local source_dirs
+    source_dirs="$(echo "$basic_result" | sed -n '3p')"
+    local dest_dirs
+    dest_dirs="$(echo "$basic_result" | sed -n '4p')"
+    local source_size
+    source_size="$(echo "$basic_result" | sed -n '5p')"
+    local dest_size
+    dest_size="$(echo "$basic_result" | sed -n '6p')"
+    local basic_discrepancies
+    basic_discrepancies="$(echo "$basic_result" | sed -n '7,$p')"
+    
+    # Initialize checksum results
+    local files_checked=0
+    local files_matched=0
+    local files_failed=0
+    local checksum_discrepancies=""
+    
+    # Perform checksum verification if requested
+    if [[ "$VERIFY_MODE" == "$VERIFY_MODE_CHECKSUM" || "$VERIFY_MODE" == "$VERIFY_MODE_FULL" ]]; then
+        local sample_rate="$SAMPLE_RATE"
+        if [[ "$VERIFY_MODE" == "$VERIFY_MODE_FULL" ]]; then
+            sample_rate=100
+        fi
+        
+        local checksum_result
+        checksum_result="$(verify_checksums "$source_dir" "$dest_dir" "$sample_rate")"
+        
+        files_checked="$(echo "$checksum_result" | sed -n '1p')"
+        files_matched="$(echo "$checksum_result" | sed -n '2p')"
+        files_failed="$(echo "$checksum_result" | sed -n '3p')"
+        checksum_discrepancies="$(echo "$checksum_result" | sed -n '4,$p')"
+    fi
+    
+    # Calculate duration
+    local end_time
+    end_time="$(date +%s)"
+    local duration=$((end_time - start_time))
+    
+    # Determine overall status
+    local status="ok"
+    local total_discrepancies=0
+    
+    if [[ -n "$basic_discrepancies" ]]; then
+        total_discrepancies=$((total_discrepancies + $(echo "$basic_discrepancies" | wc -l)))
+    fi
+    
+    if [[ $files_failed -gt 0 ]]; then
+        total_discrepancies=$((total_discrepancies + files_failed))
+    fi
+    
+    if [[ $total_discrepancies -gt 0 ]]; then
+        status="failed"
+    fi
+    
+    local message="Verification completed: $total_discrepancies discrepancies found"
+    if [[ $total_discrepancies -eq 0 ]]; then
+        message="Verification passed: no discrepancies found"
+    fi
+    
+    log_info "$message"
+    log_info "Duration: ${duration}s"
+    
+    # Write results to JSON
+    local results_file="$freight_dir/verify.json"
+    generate_verification_json "$source_dir" "$dest_dir" "$operation_id" "$start_time" "$end_time" \
+        "$status" "$source_files" "$dest_files" "$source_dirs" "$dest_dirs" "$source_size" "$dest_size" \
+        "$files_checked" "$files_matched" "$files_failed" "$basic_discrepancies" "$checksum_discrepancies" > "$results_file"
+    
+    # Send completion message
+    socket_stop "$TOOL_NAME" "$source_dir" "$status" "" "$message"
+    
+    log_operation_end "verify" "$source_dir" "$operation_id" "$status" "$duration" "0"
+    
+    if [[ "$status" == "ok" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Generate verification results JSON
+generate_verification_json() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local operation_id="$3"
+    local start_time="$4"
+    local end_time="$5"
+    local status="$6"
+    local source_files="$7"
+    local dest_files="$8"
+    local source_dirs="$9"
+    local dest_dirs="${10}"
+    local source_size="${11}"
+    local dest_size="${12}"
+    local files_checked="${13}"
+    local files_matched="${14}"
+    local files_failed="${15}"
+    local basic_discrepancies="${16}"
+    local checksum_discrepancies="${17}"
+    
+    # Build discrepancies JSON arrays
+    local basic_disc_json="["
+    if [[ -n "$basic_discrepancies" ]]; then
+        local first=true
+        while IFS= read -r disc; do
+            if [[ -n "$disc" ]]; then
+                if [[ "$first" == "true" ]]; then
+                    first=false
+                else
+                    basic_disc_json+=","
+                fi
+                basic_disc_json+="\"$disc\""
+            fi
+        done <<< "$basic_discrepancies"
+    fi
+    basic_disc_json+="]"
+    
+    local checksum_disc_json="["
+    if [[ -n "$checksum_discrepancies" ]]; then
+        local first=true
+        while IFS= read -r disc; do
+            if [[ -n "$disc" ]]; then
+                if [[ "$first" == "true" ]]; then
+                    first=false
+                else
+                    checksum_disc_json+=","
+                fi
+                checksum_disc_json+="\"$disc\""
+            fi
+        done <<< "$checksum_discrepancies"
+    fi
+    checksum_disc_json+="]"
+    
+    # Generate complete JSON
+    cat << EOF
+{
+  "verification_id": "$operation_id",
+  "source_path": "$source_dir",
+  "dest_path": "$dest_dir",
+  "timestamp": "$(get_timestamp)",
+  "start_time": "$(date -d "@$start_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "end_time": "$(date -d "@$end_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "duration": $((end_time - start_time)),
+  "verification_mode": "$VERIFY_MODE",
+  "sample_rate": $SAMPLE_RATE,
+  "status": "$status",
+  "basic_verification": {
+    "source_files": $source_files,
+    "dest_files": $dest_files,
+    "source_directories": $source_dirs,
+    "dest_directories": $dest_dirs,
+    "source_size": $source_size,
+    "dest_size": $dest_size,
+    "discrepancies": $basic_disc_json
+  },
+  "checksum_verification": {
+    "files_checked": $files_checked,
+    "files_matched": $files_matched,
+    "files_failed": $files_failed,
+    "discrepancies": $checksum_disc_json
+  },
+  "tool_version": "$VERSION",
+  "hostname": "$(hostname)",
+  "user": "$(whoami)"
+}
+EOF
+}
+
+# Main function
+main() {
+    # Parse arguments
+    parse_args "$@"
+    
+    # Convert to absolute paths
+    SOURCE_DIR="$(realpath "$SOURCE_DIR")"
+    DEST_DIR="$(realpath "$DEST_DIR")"
+    
+    # Validate directories
+    if ! validate_directory "$SOURCE_DIR" "read"; then
+        exit 1
+    fi
+    
+    if ! validate_directory "$DEST_DIR" "read"; then
+        exit 1
+    fi
+    
+    # Set up logging
+    local freight_dir
+    freight_dir="$(get_freight_dir "$SOURCE_DIR")"
+    ensure_freight_dir "$freight_dir"
+    init_logging "$TOOL_NAME" "$freight_dir"
+    
+    # Initialize socket communication
+    socket_init "$TOOL_NAME" "$SOURCE_DIR"
+    socket_setup_cleanup
+    
+    # Set up signal handlers
+    setup_signal_handlers
+    
+    log_system_info
+    log_info "freight-verify $VERSION starting"
+    log_info "Source: $SOURCE_DIR"
+    log_info "Destination: $DEST_DIR"
+    log_info "Mode: $VERIFY_MODE"
+    
+    # Perform the verification
+    if perform_verification "$SOURCE_DIR" "$DEST_DIR" "$freight_dir"; then
+        log_info "Verification completed successfully"
+        exit 0
+    else
+        log_error "Verification failed - discrepancies found"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

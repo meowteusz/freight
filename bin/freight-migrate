@@ -1,0 +1,485 @@
+#!/bin/bash
+set -euo pipefail
+
+# Get script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/logging.sh"
+source "$LIB_DIR/socket.sh"
+
+# Tool configuration
+TOOL_NAME="migrate"
+VERSION="0.1.0"
+
+# Default rsync flags (as per architecture)
+DEFAULT_RSYNC_FLAGS="-avxHAX --numeric-ids --compress"
+
+# Usage information
+usage() {
+    cat << EOF
+freight-migrate - Migration Engine
+
+USAGE:
+    freight-migrate [OPTIONS] SOURCE DESTINATION
+
+ARGUMENTS:
+    SOURCE       Source directory to migrate
+    DESTINATION  Destination directory
+
+OPTIONS:
+    -h, --help       Show this help message
+    -v, --verbose    Enable verbose output
+    -q, --quiet      Suppress non-error output
+    --version        Show version information
+    --dry-run        Perform dry run without actual transfer
+    --config FILE    Use custom configuration file
+    --rsync-flags    Custom rsync flags (overrides default)
+    --retry COUNT    Number of retry attempts (default: 3)
+
+DESCRIPTION:
+    Executes directory transfers with intelligent load balancing.
+    Requires connection to freight daemon for coordination and monitoring.
+    Uses rsync for atomic directory migration with comprehensive logging.
+
+EXAMPLES:
+    freight-migrate /nfs1/user1 /nfs2/user1    # Migrate user directory
+    freight-migrate --dry-run /src /dst        # Preview migration
+    freight-migrate --retry 5 /src /dst        # Custom retry count
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    VERBOSE=false
+    QUIET=false
+    DRY_RUN=false
+    CONFIG_FILE=""
+    CUSTOM_RSYNC_FLAGS=""
+    RETRY_COUNT=3
+    SOURCE_DIR=""
+    DEST_DIR=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                export CURRENT_LOG_LEVEL=$LOG_LEVEL_ERROR
+                shift
+                ;;
+            --version)
+                echo "freight-migrate $VERSION"
+                exit 0
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --rsync-flags)
+                CUSTOM_RSYNC_FLAGS="$2"
+                shift 2
+                ;;
+            --retry)
+                RETRY_COUNT="$2"
+                shift 2
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$SOURCE_DIR" ]]; then
+                    SOURCE_DIR="$1"
+                elif [[ -z "$DEST_DIR" ]]; then
+                    DEST_DIR="$1"
+                else
+                    log_error "Too many arguments"
+                    usage >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$SOURCE_DIR" || -z "$DEST_DIR" ]]; then
+        log_error "Both SOURCE and DESTINATION are required"
+        usage >&2
+        exit 1
+    fi
+}
+
+# Load migration configuration
+load_migration_config() {
+    local config_file="$1"
+    local rsync_flags="$DEFAULT_RSYNC_FLAGS"
+    local retry_attempts="$RETRY_COUNT"
+    
+    if [[ -n "$config_file" && -f "$config_file" ]]; then
+        log_info "Loading configuration from: $config_file"
+        
+        if command -v jq >/dev/null 2>&1; then
+            # Parse JSON config
+            local config_rsync_flags
+            config_rsync_flags="$(jq -r '.rsync_flags // empty' "$config_file" 2>/dev/null || true)"
+            if [[ -n "$config_rsync_flags" ]]; then
+                rsync_flags="$config_rsync_flags"
+            fi
+            
+            local config_retry_attempts
+            config_retry_attempts="$(jq -r '.retry_attempts // empty' "$config_file" 2>/dev/null || true)"
+            if [[ -n "$config_retry_attempts" ]]; then
+                retry_attempts="$config_retry_attempts"
+            fi
+        else
+            log_warn "jq not available, using default configuration"
+        fi
+    fi
+    
+    # Override with command line flags
+    if [[ -n "$CUSTOM_RSYNC_FLAGS" ]]; then
+        rsync_flags="$CUSTOM_RSYNC_FLAGS"
+    fi
+    
+    # Validate rsync flags
+    validate_rsync_flags "$rsync_flags"
+    
+    echo "$rsync_flags"
+    echo "$retry_attempts"
+}
+
+# Check if daemon is available (required for migrate)
+check_daemon_connection() {
+    if ! socket_test_connection; then
+        log_error "Cannot connect to freight daemon - migration requires orchestrator"
+        log_error "Please start the freight daemon first: freight daemon"
+        return 1
+    fi
+    return 0
+}
+
+# Perform rsync migration
+perform_rsync() {
+    local source="$1"
+    local destination="$2"
+    local rsync_flags="$3"
+    local attempt="$4"
+    local max_attempts="$5"
+    
+    log_info "Starting rsync (attempt $attempt/$max_attempts): $source -> $destination"
+    
+    # Build rsync command
+    local rsync_cmd="rsync $rsync_flags"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        rsync_cmd="$rsync_cmd --dry-run"
+    fi
+    
+    # Add progress reporting for verbose mode
+    if [[ "$VERBOSE" == "true" ]]; then
+        rsync_cmd="$rsync_cmd --progress"
+    fi
+    
+    # Ensure source ends with / for directory contents
+    if [[ ! "$source" =~ /$ ]]; then
+        source="$source/"
+    fi
+    
+    rsync_cmd="$rsync_cmd \"$source\" \"$destination\""
+    
+    log_debug "Executing: $rsync_cmd"
+    
+    # Execute rsync and capture output
+    local rsync_output
+    local rsync_exit_code
+    local start_time
+    start_time="$(date +%s)"
+    
+    if rsync_output="$(eval "$rsync_cmd" 2>&1)"; then
+        rsync_exit_code=0
+    else
+        rsync_exit_code=$?
+    fi
+    
+    local end_time
+    end_time="$(date +%s)"
+    local duration=$((end_time - start_time))
+    
+    # Parse rsync output for statistics
+    local bytes_transferred=0
+    local transfer_rate=""
+    local files_transferred=0
+    
+    if [[ -n "$rsync_output" ]]; then
+        # Extract statistics from rsync output
+        bytes_transferred="$(echo "$rsync_output" | grep -o 'sent [0-9,]* bytes' | grep -o '[0-9,]*' | tr -d ',' || echo "0")"
+        transfer_rate="$(echo "$rsync_output" | grep -o '[0-9.]*[KMG]B/sec' || echo "")"
+        files_transferred="$(echo "$rsync_output" | grep -o 'Number of files transferred: [0-9]*' | grep -o '[0-9]*' || echo "0")"
+    fi
+    
+    # Log results
+    if [[ $rsync_exit_code -eq 0 ]]; then
+        log_info "Rsync completed successfully in ${duration}s"
+        if [[ -n "$transfer_rate" ]]; then
+            log_info "Transfer rate: $transfer_rate"
+        fi
+        log_info "Files transferred: $files_transferred, Bytes: $(format_bytes "$bytes_transferred")"
+    else
+        log_error "Rsync failed with exit code $rsync_exit_code"
+        log_error "Rsync output: $rsync_output"
+    fi
+    
+    # Return results
+    echo "$rsync_exit_code"
+    echo "$bytes_transferred"
+    echo "$transfer_rate"
+    echo "$files_transferred"
+    echo "$duration"
+    echo "$rsync_output"
+}
+
+# Perform migration with retry logic
+perform_migration() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local freight_dir="$3"
+    local operation_id
+    
+    operation_id="$(log_operation_start "migrate" "$source_dir")"
+    local overall_start_time
+    overall_start_time="$(date +%s)"
+    
+    log_info "Starting migration: $source_dir -> $dest_dir"
+    socket_start "$TOOL_NAME" "$source_dir"
+    
+    # Load configuration
+    local config_file="$freight_dir/config.json"
+    if [[ -n "$CONFIG_FILE" ]]; then
+        config_file="$CONFIG_FILE"
+    fi
+    
+    local config_result
+    config_result="$(load_migration_config "$config_file")"
+    local rsync_flags
+    rsync_flags="$(echo "$config_result" | head -n1)"
+    local retry_attempts
+    retry_attempts="$(echo "$config_result" | tail -n1)"
+    
+    log_info "Using rsync flags: $rsync_flags"
+    log_info "Retry attempts: $retry_attempts"
+    
+    # Create destination directory if it doesn't exist
+    if [[ ! -d "$dest_dir" ]]; then
+        log_info "Creating destination directory: $dest_dir"
+        if ! mkdir -p "$dest_dir"; then
+            log_error "Failed to create destination directory: $dest_dir"
+            socket_stop "$TOOL_NAME" "$source_dir" "failed" "" "Failed to create destination"
+            return 1
+        fi
+    fi
+    
+    # Attempt migration with retries
+    local attempt=1
+    local migration_successful=false
+    local final_bytes_transferred=0
+    local final_transfer_rate=""
+    local final_files_transferred=0
+    local total_duration=0
+    local migration_log=""
+    
+    while [[ $attempt -le $retry_attempts && "$migration_successful" == "false" ]]; do
+        log_info "Migration attempt $attempt of $retry_attempts"
+        socket_progress "$TOOL_NAME" "$source_dir" "Attempt $attempt/$retry_attempts"
+        
+        # Perform rsync
+        local rsync_result
+        rsync_result="$(perform_rsync "$source_dir" "$dest_dir" "$rsync_flags" "$attempt" "$retry_attempts")"
+        
+        # Parse results
+        local exit_code
+        exit_code="$(echo "$rsync_result" | sed -n '1p')"
+        local bytes_transferred
+        bytes_transferred="$(echo "$rsync_result" | sed -n '2p')"
+        local transfer_rate
+        transfer_rate="$(echo "$rsync_result" | sed -n '3p')"
+        local files_transferred
+        files_transferred="$(echo "$rsync_result" | sed -n '4p')"
+        local duration
+        duration="$(echo "$rsync_result" | sed -n '5p')"
+        local rsync_output
+        rsync_output="$(echo "$rsync_result" | sed -n '6,$p')"
+        
+        total_duration=$((total_duration + duration))
+        migration_log="$migration_log\nAttempt $attempt: exit_code=$exit_code, duration=${duration}s"
+        
+        if [[ $exit_code -eq 0 ]]; then
+            migration_successful=true
+            final_bytes_transferred="$bytes_transferred"
+            final_transfer_rate="$transfer_rate"
+            final_files_transferred="$files_transferred"
+            break
+        else
+            log_warn "Migration attempt $attempt failed, exit code: $exit_code"
+            if [[ $attempt -lt $retry_attempts ]]; then
+                log_info "Retrying in 5 seconds..."
+                sleep 5
+            fi
+        fi
+        
+        ((attempt++))
+    done
+    
+    # Calculate overall duration
+    local overall_end_time
+    overall_end_time="$(date +%s)"
+    local overall_duration=$((overall_end_time - overall_start_time))
+    
+    # Generate results
+    local status="failed"
+    local message="Migration failed after $retry_attempts attempts"
+    
+    if [[ "$migration_successful" == "true" ]]; then
+        status="ok"
+        message="Migration completed successfully"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            message="[DRY RUN] Migration would complete successfully"
+        fi
+    fi
+    
+    log_info "Migration result: $message"
+    log_info "Total duration: ${overall_duration}s, Transfer duration: ${total_duration}s"
+    
+    # Write results to JSON
+    local results_file="$freight_dir/migrate.json"
+    generate_migration_json "$source_dir" "$dest_dir" "$operation_id" "$overall_start_time" "$overall_end_time" \
+        "$status" "$final_bytes_transferred" "$final_transfer_rate" "$final_files_transferred" \
+        "$rsync_flags" "$attempt" "$migration_log" > "$results_file"
+    
+    # Send completion message
+    socket_stop "$TOOL_NAME" "$source_dir" "$status" "$final_bytes_transferred" "$message"
+    
+    log_operation_end "migrate" "$source_dir" "$operation_id" "$status" "$overall_duration" "$final_bytes_transferred"
+    
+    if [[ "$migration_successful" == "true" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Generate migration results JSON
+generate_migration_json() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local operation_id="$3"
+    local start_time="$4"
+    local end_time="$5"
+    local status="$6"
+    local bytes_transferred="$7"
+    local transfer_rate="$8"
+    local files_transferred="$9"
+    local rsync_flags="${10}"
+    local attempts_made="${11}"
+    local migration_log="${12}"
+    
+    # Generate complete JSON
+    cat << EOF
+{
+  "migration_id": "$operation_id",
+  "source_path": "$source_dir",
+  "dest_path": "$dest_dir",
+  "rsync_command": "rsync $rsync_flags \"$source_dir/\" \"$dest_dir\"",
+  "start_time": "$(date -d "@$start_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "end_time": "$(date -d "@$end_time" -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "duration": $((end_time - start_time)),
+  "bytes_transferred": $bytes_transferred,
+  "transfer_rate": "$transfer_rate",
+  "file_count": $files_transferred,
+  "status": "$status",
+  "attempts_made": $attempts_made,
+  "dry_run": $([[ "$DRY_RUN" == "true" ]] && echo "true" || echo "false"),
+  "migration_log": "$migration_log",
+  "tool_version": "$VERSION",
+  "hostname": "$(hostname)",
+  "user": "$(whoami)"
+}
+EOF
+}
+
+# Main function
+main() {
+    # Parse arguments
+    parse_args "$@"
+    
+    # Convert to absolute paths
+    SOURCE_DIR="$(realpath "$SOURCE_DIR")"
+    DEST_DIR="$(realpath "$DEST_DIR")"
+    
+    # Validate source directory
+    if ! validate_directory "$SOURCE_DIR" "read"; then
+        exit 1
+    fi
+    
+    # Validate destination parent directory
+    local dest_parent
+    dest_parent="$(dirname "$DEST_DIR")"
+    if ! validate_directory "$dest_parent" "write"; then
+        exit 1
+    fi
+    
+    # Check daemon connection (required for migration)
+    if ! check_daemon_connection; then
+        exit 1
+    fi
+    
+    # Set up logging
+    local freight_dir
+    freight_dir="$(get_freight_dir "$SOURCE_DIR")"
+    ensure_freight_dir "$freight_dir"
+    init_logging "$TOOL_NAME" "$freight_dir"
+    
+    # Initialize socket communication
+    socket_init "$TOOL_NAME" "$SOURCE_DIR"
+    socket_setup_cleanup
+    
+    # Set up signal handlers
+    setup_signal_handlers
+    
+    log_system_info
+    log_info "freight-migrate $VERSION starting"
+    log_info "Source: $SOURCE_DIR"
+    log_info "Destination: $DEST_DIR"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN MODE - no files will be transferred"
+    fi
+    
+    # Perform the migration
+    if perform_migration "$SOURCE_DIR" "$DEST_DIR" "$freight_dir"; then
+        log_info "Migration completed successfully"
+        exit 0
+    else
+        log_error "Migration failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"
